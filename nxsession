@@ -1,0 +1,215 @@
+#!/bin/bash
+
+# original name:nxsession
+# Simple script to create/resume a remote NX session and connect to it.
+#
+# NX can be used without specific client software. All that is needed is nxagent and nxproxy.
+# The reason that this is more than 5 lines is the suspend/resume logic built in nxagent.
+#
+# This is replacement for freeNX and any NX client software.
+#
+# In order to use this you need:
+# 1. NX base installed (nxagent, nxproxy, nxcomp) on the (remote) client, and (nxproxy, nxcomp) on the (local) server
+# 2. bash, fuser, awk, xauth, hexdump on the (remote) client, bash on the (local) server
+#
+# freeNX or any NX client is NOT needed.
+# 
+# In the simplest case just run (on the local server):
+#   nxsession :<x port> -h <host>
+# (if -h is omitted a local session is created/resumed, you later connect to that session through another server)
+# 
+# If -h is present, you'll be requested to log in the remote (client) machine via SSH.
+# An NX session is automatically created/resumed on the client. When the session is created .nxstartup is execute
+# to start default X applications. When the last X application has ended the remote NX session ends automatically.
+# All traffic is tunelled through the SSH connection.
+#
+# If the requested session is currently used from another machine add -f to force suspension of that other server connection.
+#
+# An MIT-MAGIC-COOKIE is generated when the session is created and used to secure the remote session.
+# In addition that cookie is passed to the (local) server to also secure the nxproxy connection.
+#
+# To suspend a session from the (local) server use:
+#   nxsession :<x port> -s
+#
+# nxsession can also be used standalone on the remote client to terminate the session (-t)
+#
+# Author: Lars Hofhansl
+#
+
+SCRIPT=`basename $0`
+
+function usage() {
+	echo "$0 port [-h host] [-ssh ssh-options] [-s] [-f]  |  $0 port -C [-f] [-t]"
+	exit 1
+}
+
+umask 0077 # make sure created files are not world/group read/writeable
+
+while [ "${1+defined}" ]; do
+	case $1 in
+	-h)
+		HOST=$2
+		shift
+		;;
+	-ssh)
+		SSH_OPTS=$2
+		shift
+		;;
+	-s)
+		SUSPEND="1"
+		;;
+	-C)
+		CLIENT="1"
+		;;
+	-o)
+		NX_OPTS=$2
+		shift
+		;;
+	-f)
+		FORCE=$1
+		;;
+	-t)
+		TERMINATE=$1
+		;;
+	*)
+		if [ -n "$X_DISPLAY" ]; then
+		usage
+		fi
+		X_DISPLAY=$1
+		NX_PORT=$(($X_DISPLAY+4000))
+		X_PORT=$(($X_DISPLAY+6000))
+		;;
+	esac
+	shift
+done
+if [ -z $X_DISPLAY ]; then
+	usage
+fi
+
+if [ -n "$CLIENT" ]; then
+	# This runs remotely, invoked from the terminal side to start
+	# or resume an X session using nxagent as the X11 server 
+
+	if [ -n "$SUSPEND" -o -n "$SSH" -o -n "$HOST" ]; then
+		usage
+	fi
+
+	NX_BASE=$HOME/.nx/C-$X_DISPLAY
+	unset DISPLAY
+
+	pid=`cat $NX_BASE/pid 2>/dev/null`
+	if grep -q nxagent /proc/$pid/cmdline 2>/dev/null; then
+		# Agent is running
+		if fuser -s $NX_PORT/tcp; then
+		# and is active
+		if [ -z $FORCE ]; then
+			echo "Another session is active, use -f to force suspension of that session"
+			exit 1
+		fi
+		# kill existing session if necessary
+		kill -HUP $pid # suspend agent
+		sleep 1
+		# kill the watchdog - if necessary
+		kill -HUP `ps --ppid $pid -o pid h` 2>/dev/null
+		sleep 1
+		fi
+		if [ -z $TERMINATE ]; then
+		# Agent is inactive... Resume
+		COOKIE=`xauth nextract - :$X_DISPLAY | awk '{print $9}'`
+		echo "nodelay=1,cleanup=0,accept=127.0.0.1,taint=1,cookie=$COOKIE,$NX_OPTS" > $NX_BASE/options
+		kill -HUP $pid
+		else
+		# we guaranteed that the session is suspended, it is safe to kill it
+		# TERM should do it.. use -9 just in case
+		kill -TERM $pid || kill -9 $pid
+		xauth remove ":$X_DISPLAY"
+		echo "Terminated :$X_DISPLAY"
+		exit 0
+		fi
+	else
+		# Start Agent
+
+		if [ -n "$TERMINATE" ]; then
+		echo "No Agent running?"
+		exit 1
+		fi	
+
+		if fuser -s $NX_PORT/tcp; then
+		echo "Port $NX_PORT is in use"
+		exit 1
+		fi
+
+		if fuser -s $X_PORT/tcp; then
+		echo "Display :$X_DISPLAY is in use"
+		exit 1
+		fi
+
+		# clear out existing Dir
+		rm -rf $NX_BASE
+		mkdir -p $NX_BASE
+
+		# secure the remote X session (generate MIT-MAGIC-COOKIE)
+		COOKIE=`head -c 16 /dev/urandom  | hexdump -e '1/1 "%02x"'`
+		xauth add :$X_DISPLAY . $COOKIE
+
+		# run agent
+		echo "nodelay=1,cleanup=0,accept=127.0.0.1,taint=1,cookie=$COOKIE,$NX_OPTS" > $NX_BASE/options
+		nxagent -display nx/nx,options=$NX_BASE/options:$X_DISPLAY :$X_DISPLAY -R -nolisten tcp -persistent -reset -dpi 96 -forcenx -class TrueColor -auth $HOME/.Xauthority &> $NX_BASE/session &
+		echo $! > $NX_BASE/pid 
+		# wait until nxagent is ready
+		while ! fuser -s $NX_PORT/tcp; do
+		sleep 1
+		done
+		# run startup script
+		env DISPLAY=:$X_DISPLAY $HOME/.nxstartup &> $NX_BASE/x_session &
+	fi
+	# send $COOKIE
+	echo "Cookie:$COOKIE" # write a line (the client will wait for this)
+	sleep 1
+
+else
+
+	## LOCAL ##
+
+	if [ -n "$TERMINATE" ]; then
+		usage
+	fi
+
+	NX_BASE=$HOME/.nx/S-$X_DISPLAY
+
+	pid=`cat $NX_BASE/pid 2>/dev/null`
+	if [ -n "$SUSPEND" ]; then
+		if kill -HUP $pid 2>/dev/null; then
+		echo "Suspending Session"
+		else
+		echo "Already Suspended?"
+		fi
+		exit 0
+	fi
+
+	if [ -z "$HOST" ]; then
+		echo "Starting/Resuming LOCAL session"
+		RESULT=$($0 $X_DISPLAY -o link=lan -C $FORCE | head -n1)
+	else
+		echo "Starting/Resuming session on $HOST"
+		# | head -n1 waits for the first line from the remote machine
+		RESULT=$(ssh -T -f -o ExitOnForwardFailure=yes -L$NX_PORT:localhost:$NX_PORT $HOST $SSH_OPTS "$SCRIPT $X_DISPLAY -o link=wan -C $FORCE" | head -n1)
+	fi
+
+	if [ "${RESULT:0:6}" != "Cookie" ]; then
+		echo "Client: $RESULT"
+		exit 1;
+	fi
+
+	COOKIE=${RESULT:7}
+
+	# clear existing dir
+	rm -rf $NX_BASE
+	mkdir -p $NX_BASE
+
+	echo "Running nxproxy... Establishing connection may take a few seconds"
+	echo "cookie=$COOKIE" > $NX_BASE/options
+	nxproxy options=$NX_BASE/options -S localhost:$X_DISPLAY &> $NX_BASE/session &
+	echo $! > $NX_BASE/pid
+
+fi
